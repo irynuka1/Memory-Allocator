@@ -1,330 +1,224 @@
-// SPDX-License-Identifier: BSD-3-Clause
-
-#include <errno.h>
-#include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <string.h>
+#include <assert.h>
+#include <stdint.h>
+#include "osmem.h"
+#include "block_meta.h"
 
-#include "../utils/block_meta.h"
-#include "../utils/osmem.h"
-#include "../utils/printf.h"
-#include "defines.h"
+#define MMAP_THRESHOLD (128 * 1024)
+#define MAP_ANONYMOUS 0x20
+#define PAGE_SIZE 4080
+#define ALIGN_BYTE(size) ((size + 7) & (~7))
+#define BLOCK_SIZE sizeof(struct block_meta)
 
-static struct block_meta *global_start;
-static size_t global_treshold = MMAP_THRESHOLD;
-static short int global_status = STATUS_FREE;
+struct block_meta *global_base;
+struct block_meta *large_alloc;
 
-void asign_block(struct block_meta **block, size_t size, int status, struct block_meta *prev, struct block_meta *next)
+void init_heap(void)
 {
-	(*block)->size = size;
-	(*block)->status = status;
-	(*block)->prev = prev;
-	(*block)->next = next;
+    if (!global_base) {
+        global_base = sbrk(0);
+        void *heap_end = sbrk(MMAP_THRESHOLD);
+
+        if (heap_end == (void *)-1)
+            return;
+
+        struct block_meta *first_block = global_base;
+        first_block->size = MMAP_THRESHOLD - BLOCK_SIZE;
+        first_block->status = STATUS_FREE;
+        first_block->next = NULL;
+        first_block->prev = NULL;
+    }
 }
 
-void coalesce(struct block_meta **block)
+struct block_meta *get_free_block(size_t size)
 {
-	if ((*block)->next && (*block)->next->status == STATUS_FREE) {
-		(*block)->size += (*block)->next->size + SIZE_BLOCK_META;
-		(*block)->next = (*block)->next->next;
+    struct block_meta *current = global_base;
 
-		if ((*block)->next)
-			(*block)->next->prev = (*block);
-	}
+    while (current) {
+        if (current->status == STATUS_FREE && current->size >= size)
+            return current;
 
-	if ((*block)->prev && (*block)->prev->status == STATUS_FREE) {
-		(*block)->prev->size += (*block)->size + SIZE_BLOCK_META;
-		(*block)->prev->next = (*block)->next;
-
-		if ((*block)->next)
-			(*block)->next->prev = (*block)->prev;
-	}
+        current = current->next;
+    }
+    return NULL;
 }
 
-void coalese_all(void)
+struct block_meta *get_last_block(void)
 {
-	struct block_meta *curr = global_start;
+    struct block_meta *current = global_base;
 
-	while (curr) {
-		if (curr->status == STATUS_FREE)
-			coalesce(&curr);
+    while (current && current->next)
+        current = current->next;
 
-		curr = curr->next;
-	}
+    return current;
 }
 
-void split_block(struct block_meta **block, size_t size)
-{
-	size_t size_mem_block = ALIGN(size) + SIZE_BLOCK_META;
+void expand_heap(size_t size) {
+    struct block_meta *last = get_last_block();
+    
+    if (last && last->status == STATUS_FREE && last->size < size) {
+        size_t additional_size = size - last->size;
+        if (sbrk(additional_size) == (void *)-1)
+            return;
 
-	if ((*block)->size >= size_mem_block + ALIGN(MIN_BLOCK_SIZE)) {
-		struct block_meta *new_block = (struct block_meta *)((char *)(*block) + size_mem_block);
+        last->size += additional_size;
+    } else {
+        struct block_meta *new_block = sbrk(size + BLOCK_SIZE);
+        if (new_block == (void *)-1)
+            return;
 
-		new_block->size = (*block)->size - size_mem_block;
-		new_block->status = STATUS_FREE;
-		new_block->prev = (*block);
-		new_block->next = (*block)->next;
+        new_block->size = size;
+        new_block->status = STATUS_FREE;
+        new_block->prev = last;
+        new_block->next = NULL;
 
-		(*block)->size = ALIGN(size);
-		(*block)->status = STATUS_ALLOC;
-		(*block)->next = new_block;
-	} else {
-		(*block)->status = STATUS_ALLOC;
-	}
+        if (last)
+            last->next = new_block;
+        else
+            global_base = new_block;
+    }
 }
 
-struct block_meta *find_fit(struct block_meta **last, size_t size)
-{
-	struct block_meta *curr = global_start;
+void coalesce_blocks(void) {
 
-	while (curr && !(curr->status == STATUS_FREE && curr->size >= size)) {
-		*last = curr;
-		curr = curr->next;
-	}
+    struct block_meta *current = global_base;
 
-	return curr;
+    while (current && current->next) {
+        if (current->status == STATUS_FREE && current->next->status == STATUS_FREE) {
+            current->size += current->next->size + BLOCK_SIZE;
+            current->next = current->next->next;
+            if (current->next)
+                current->next->prev = current;
+        } else {
+            current = current->next;
+        }
+    }
 }
 
-void *heap_prealloc(size_t size)
-{
-	void *mem = sbrk(size);
+void split_block(struct block_meta *block, size_t size) {
+    if (block->size > size + BLOCK_SIZE) {
+        struct block_meta *new_block = (struct block_meta *)((char *)block + size + BLOCK_SIZE);
+        new_block->size = block->size - size - BLOCK_SIZE;
+        new_block->status = STATUS_FREE;
+        new_block->next = block->next;
+        new_block->prev = block;
 
-	if (mem == (void *)-1) {
-		DIE(mem == (void *)-1, "heap_prealloc");
-		return NULL;
-	}
+        block->size = size;
+        block->next = new_block;
 
-	global_start = (struct block_meta *)mem;
-	global_start->size = size - SIZE_BLOCK_META;
-	global_start->status = STATUS_ALLOC;
-	global_start->prev = NULL;
-	global_start->next = NULL;
-
-	void *payload = (char *)global_start + SIZE_BLOCK_META;
-
-	return payload;
+        if (new_block->next)
+            new_block->next->prev = new_block;
+    }
 }
 
-void *extend_block(struct block_meta *block, size_t size)
-{
-	void *mem = sbrk(ALIGN(size) - block->size);
+void *os_malloc(size_t size) {
+    if (size == 0)
+        return NULL;
 
-	if (mem == (void *)-1) {
-		DIE(mem == (void *)-1, "extend_block");
-		return NULL;
-	}
+    size_t aligned_size = ALIGN_BYTE(size);
+    if (aligned_size < MMAP_THRESHOLD - BLOCK_SIZE) {
+        init_heap();
 
-	block->size = ALIGN(size);
-	block->status = STATUS_ALLOC;
+        struct block_meta *block = get_free_block(aligned_size);
+        if (block) {
+            block->status = STATUS_ALLOC;
+            split_block(block, aligned_size);
+            return (void *)(block + 1);
+        }
 
-	return mem;
+        expand_heap(aligned_size);
+        block = get_free_block(aligned_size);
+        if (block) {
+            block->status = STATUS_ALLOC;
+            split_block(block, aligned_size);
+            return (void *)(block + 1);
+        }
+    }
+
+    void *mapped_block = mmap(NULL, aligned_size + BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped_block == MAP_FAILED)
+        return NULL;
+
+    struct block_meta *new_block = (struct block_meta *)mapped_block;
+    new_block->size = aligned_size;
+    new_block->status = STATUS_MAPPED;
+    new_block->prev = NULL;
+    new_block->next = large_alloc;
+
+    if (large_alloc)
+        large_alloc->prev = new_block;
+    large_alloc = new_block;
+
+    return (void *)(new_block + 1);
 }
 
-void *os_malloc(size_t size)
-{
-	/* TODO: Implement os_malloc */
+// free a block
+void os_free(void *ptr) {
+    if (!ptr)
+        return;
 
-	if (size <= 0)
-		return NULL;
+    struct block_meta *block = (struct block_meta *)((char *)ptr - BLOCK_SIZE);
 
-	size_t size_mem_block = ALIGN(size) + SIZE_BLOCK_META;
-	size_t size_block_meta = ALIGN(size);
+    if (block->status == STATUS_FREE)
+        return;
 
-	if (size_mem_block <= global_treshold) {
-		if (global_status == STATUS_FREE) {
-			void *mem = heap_prealloc(MMAP_THRESHOLD);
+    struct block_meta *last_block = get_last_block();
+    if (block >= global_base && block <= last_block) {
+        block->status = STATUS_FREE;
+        coalesce_blocks();
+        return;
+    }
 
-			if (mem == NULL) {
-				DIE(mem == NULL, "os_malloc");
-				return NULL;
-			}
+    if (block == large_alloc)
+        large_alloc = block->next;
 
-			global_status = STATUS_ALLOC;
+    if (block->prev)
+        block->prev->next = block->next;
 
-			return mem;
-		}
-		// global_status == STATUS_ALLOC
-		struct block_meta *last = global_start;
-		struct block_meta *block = find_fit(&last, size_block_meta);
+    if (block->next)
+        block->next->prev = block->prev;
 
-		if (block) {
-			split_block(&block, size);
-
-			void *payload = (char *)block + SIZE_BLOCK_META;
-
-			return payload;
-
-		} else { // block == NULL
-			if (last->status == STATUS_FREE) {
-				void *mem = extend_block(last, size);
-
-				if (mem == NULL) {
-					DIE(mem == NULL, "extend_block");
-					return NULL;
-				}
-
-				void *payload = (char *)last + SIZE_BLOCK_META;
-
-				return payload;
-			}
-
-			void *mem = sbrk(size_mem_block);
-
-			if (mem == (void *)-1) {
-				DIE(mem == (void *)-1, "os_malloc");
-				return NULL;
-			}
-
-			block = (struct block_meta *)mem;
-			asign_block(&block, size_block_meta, STATUS_ALLOC, last, NULL);
-			last->next = block;
-
-			void *payload = (char *)block + SIZE_BLOCK_META;
-
-			return payload;
-		}
-	} else { // size_mem_block > MMAP_THRESHOLD
-		void *mem = mmap(NULL, size_mem_block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-		if (mem == MAP_FAILED) {
-			DIE(mem == MAP_FAILED, "os_malloc");
-			return NULL;
-		}
-
-		if (!global_start)
-			global_start = (struct block_meta *)mem;
-
-		struct block_meta *block = (struct block_meta *)mem;
-
-		asign_block(&block, size_block_meta, STATUS_MAPPED, NULL, NULL);
-
-		void *payload = (char *)block + SIZE_BLOCK_META;
-
-		return payload;
-	}
-	return NULL;
-}
-
-void os_free(void *ptr)
-{
-	/* TODO: Implement os_free */
-
-	if (!ptr)
-		return;
-
-	struct block_meta *block = (struct block_meta *)((char *)ptr - SIZE_BLOCK_META);
-
-	if (block->status == STATUS_ALLOC) {
-		block->status = STATUS_FREE;
-		coalese_all();
-
-	} else if (block->status == STATUS_MAPPED) {
-		block->status = STATUS_FREE;
-		munmap(block, block->size + SIZE_BLOCK_META);
-	}
+    block->status = STATUS_FREE;
+    munmap(block, block->size + BLOCK_SIZE);
 }
 
 void *os_calloc(size_t nmemb, size_t size)
 {
-	/* TODO: Implement os_calloc */
+	// /* TODO: Implement os_calloc */
+	// size_t cc = size * nmemb;
+	// size_t new_size = ALIGN_BYTE(cc);
 
-	// if (nmemb <= 0 || size <= 0)
+	// if (nmemb == 0 || size == 0)
 	// 	return NULL;
 
-	// size_t total_size = nmemb * size;
+	// if ((int)new_size < PAGE_SIZE) {
+	// 	void *ptr = os_malloc(new_size);
 
-	// global_treshold = PAGE_SIZE;
-	// void *mem = os_malloc(total_size);
+	// 	if (ptr)
+	// 		memset(ptr, 0, new_size);
+	// 	return ptr;
+	// }
+	// void *block = mmap(NULL, new_size + BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-	// global_treshold = MMAP_THRESHOLD;
+	// if (block == MAP_FAILED)
+	// 	return NULL;
 
-	// memset(mem, 0, total_size);
+	// struct block_meta *new_block = block;
 
-	// return mem;
+	// new_block->size = new_size;
+	// new_block->status = STATUS_MAPPED;
+	// new_block->prev = NULL;
+	// new_block->next = large_alloc;
+	// if (large_alloc)
+	// 	large_alloc->prev = new_block;
+	// large_alloc = new_block;
+	// memset(block + 32, 0, new_size);
+	// return (void *)(new_block + 1);
 }
 
 void *os_realloc(void *ptr, size_t size)
 {
-	/* TODO: Implement os_realloc */
-
-	// if (!ptr)
-	// 	return os_malloc(size);
-
-	// if (size <= 0) {
-	// 	os_free(ptr);
-	// 	return NULL;
-	// }
-
-	// struct block_meta *block = (struct block_meta *)((char *)ptr - SIZE_BLOCK_META);
-	// size_t size_block_meta = ALIGN(size);
-
-	// coalese_all();
-
-	// if (block->status == STATUS_FREE)
-	// 	return NULL;
-
-	// if (block->status == STATUS_MAPPED) {
-	// 	//global_status = STATUS_FREE;
-	// 	void *new_mem = os_malloc(size);
-
-	// 	if (new_mem == NULL) {
-	// 		DIE(new_mem == NULL, "os_realloc");
-	// 		return NULL;
-	// 	}
-
-	// 	if (block->size < size_block_meta)
-	// 		memcpy(new_mem, ptr, block->size);
-	// 	else
-	// 		memcpy(new_mem, ptr, size_block_meta);
-
-	// 	os_free(ptr);
-
-	// 	return new_mem;
-	// }
-
-	// // block->status == STATUS_ALLOC
-
-	// if (block->size >= size_block_meta) {
-	// 	split_block(&block, size);
-
-	// 	return ptr;
-	// }
-
-	// if (!block->next) {
-	// 	void *new_mem = extend_block(block, size);
-
-	// 	if (new_mem == NULL) {
-	// 		DIE(new_mem == NULL, "os_realloc");
-	// 		return NULL;
-	// 	}
-
-	// 	return ptr;
-	// }
-
-	// if (block->next->status == STATUS_FREE) {
-	// 	if (block->size + block->next->size + SIZE_BLOCK_META >= size_block_meta) {
-	// 		coalesce(&block);
-	// 		split_block(&block, size);
-
-	// 		return ptr;
-	// 	}
-	// }
-
-	// if (block->size < size_block_meta) {
-	// 	void *new_mem = os_malloc(size);
-
-	// 	if (new_mem == NULL) {
-	// 		DIE(new_mem == NULL, "os_realloc");
-	// 		return NULL;
-	// 	}
-
-	// 	memcpy(new_mem, ptr, block->size);
-
-	// 	os_free(ptr);
-
-	// 	return new_mem;
-	// }
-
 	return NULL;
 }
