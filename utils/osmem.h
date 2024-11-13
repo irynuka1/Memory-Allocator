@@ -8,10 +8,9 @@
 #include "printf.h"
 
 #define MMAP_THRESHOLD (128 * 1024)
-#define MAP_ANONYMOUS 0x20
 #define PAGE_SIZE 4080
-#define ALIGN_BYTE(size) ((size + 7) & (~7))
-#define BLOCK_SIZE sizeof(struct block_meta)
+#define ALIGN_SIZE(size) ((size + 7) & ~(7))
+#define META_SIZE sizeof(struct block_meta)
 
 void *os_malloc(size_t size);
 void os_free(void *ptr);
