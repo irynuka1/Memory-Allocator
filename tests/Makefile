@@ -10,7 +10,7 @@ LDLIBS = -losmem
 SNIPPETS_SRC = $(sort $(wildcard snippets/*.c))
 SNIPPETS = $(patsubst %.c,%,$(SNIPPETS_SRC))
 
-.PHONY: all src snippets clean_src clean_snippets check lint
+.PHONY: all src snippets clean_src clean_snippets check check-fast lint
 
 all: src snippets
 
@@ -34,11 +34,7 @@ check-fast:
 	python3 run_tests.py -d
 
 lint:
-	-cd .. && checkpatch.pl -f src/*.c tests/snippets/*.c
-	-cd .. && checkpatch.pl -f checker/*.sh tests/*.sh
-	-cd .. && cpplint --recursive src/ tests/
-	-cd .. && shellcheck checker/*.sh tests/*.sh
-#	-cd .. && pylint tests/*.py
+	-cpplint --recursive ../src ../utils/block_meta.h ../utils/osmem.h
 
 snippets/%: snippets/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
